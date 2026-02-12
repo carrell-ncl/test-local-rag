@@ -1,0 +1,16 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+opensearch-py==2.6.0
+
+boto3==1.34.162
+redis==5.0.8
+
+pydantic==2.8.2
+python-dotenv==1.0.1
+
+httpx==0.27.2
+tenacity==9.0.0
+
+PyMuPDF==1.24.9
+numpy==2.0.1

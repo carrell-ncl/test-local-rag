@@ -1,0 +1,22 @@
+[
+  {
+    "arxiv_id": "1710.10903",
+    "version": "",
+    "pdf_url": "https://arxiv.org/pdf/1710.10903.pdf",
+    "title": "Graph Attention Networks",
+    "authors": ["Petar Veličković", "Guillem Cucurull"],
+    "categories": ["stat.ML", "cs.LG"],
+    "published": "2017-10-30T00:00:00Z",
+    "metadata": { "abs_url": "https://arxiv.org/abs/1710.10903" }
+  },
+  {
+    "arxiv_id": "1810.00826",
+    "version": "",
+    "pdf_url": "https://arxiv.org/pdf/1810.00826.pdf",
+    "title": "How Powerful are Graph Neural Networks?",
+    "authors": ["Keyulu Xu", "Jure Leskovec"],
+    "categories": ["cs.LG", "stat.ML"],
+    "published": "2018-10-01T00:00:00Z",
+    "metadata": { "abs_url": "https://arxiv.org/abs/1810.00826" }
+  }
+]
