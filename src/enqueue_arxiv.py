@@ -1,21 +1,44 @@
 #!/usr/bin/env python3
 """
-Enqueue arXiv papers into Redis for downstream ingestion.
+Enqueue arXiv papers into Redis for ingestion, with OpenSearch-based deduplication.
 
-This script queries the official arXiv API (Atom feed), extracts metadata,
-and pushes jobs into a Redis queue compatible with `ingest_worker.py`.
+What it does:
+- Queries arXiv Atom API for papers matching a query and optional category filters.
+- Builds one "job" dict per paper (your existing job.json schema).
+- Dedupes by arxiv_id against an OpenSearch index (rag_chunks or rag_docs).
+- Pushes jobs onto Redis list queue (default: ingest:arxiv).
 
-Typical use cases:
-- Build a subject-focused RAG corpus (e.g. Graph Neural Networks).
-- Periodically ingest recent arXiv papers.
-- Mirror an AWS-style fetch → queue → worker pipeline locally.
+Why this is useful:
+- Avoids hand-editing jobs.json.
+- Lets you scale ingestion by running multiple ingest workers.
+- Guarantees you don't re-ingest papers you already indexed.
 
-Example:
-    python enqueue_arxiv.py \
-        --query "graph neural network" \
-        --category cs.LG \
-        --max-results 50 \
-        --dedupe
+Ensure Redis container running:
+docker compose up -d redis 
+
+Usage examples:
+  # Enqueue 50 papers about graph neural networks from cs.LG/cs.AI/stat.ML, deduping against rag_chunks
+  python -m src.enqueue_arxiv \
+    --query "graph neural network" \
+    --categories cs.LG,cs.AI,stat.ML \
+    --max-results 50 \
+    --dedupe \
+    --dedupe-index rag_chunks
+
+    make worker
+    # or
+    python -m src.ingest_worker --index rag_chunks
+
+
+  # Enqueue by category only (no keyword query)
+  python -m src.enqueue_arxiv --query "cat:cs.LG" --max-results 100 --dedupe
+
+  # Write jobs to a file (JSON Lines) as well
+  python -m src.enqueue_arxiv --query "graph attention" --max-results 25 --out jobs.jsonl --dedupe
+
+Notes:
+- arXiv API is eventually consistent; some queries may return fewer than requested.
+- arXiv IDs may appear like "http://arxiv.org/abs/1710.10903v1" in the feed; we normalize.
 """
 
 from __future__ import annotations
@@ -25,314 +48,379 @@ import json
 import os
 import re
 import time
-import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-import redis
 import requests
+import redis
+from opensearchpy import OpenSearch
 
 
-ARXIV_API = os.getenv("ARXIV_API", "https://export.arxiv.org/api/query")
+# -------------------------
+# Environment defaults
+# -------------------------
+
+ARXIV_API = "https://export.arxiv.org/api/query"
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_QUEUE = os.getenv("REDIS_QUEUE", "ingest:arxiv")
 
-# Atom namespace used by arXiv API
-ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
 
-# Be polite to arXiv (recommended delay between requests)
-DEFAULT_THROTTLE_S = float(os.getenv("ARXIV_THROTTLE_SECONDS", "3.0"))
+DEFAULT_DEDUPE_INDEX = os.getenv("OS_INDEX", "rag_chunks")
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+_ARXIV_ID_RE = re.compile(r"(?:arxiv\.org/(?:abs|pdf)/)?(?P<id>\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?$", re.I)
+
+
+def normalize_arxiv_id(raw: str) -> str:
+    """Normalize various arXiv ID formats to plain 'YYYY.NNNNN'.
+
+    Args:
+        raw: Raw ID or URL from arXiv feed.
+
+    Returns:
+        Normalized arXiv id.
+
+    Raises:
+        ValueError: if the id can't be normalized.
+    """
+    raw = (raw or "").strip()
+    raw = raw.replace("http://", "https://")
+
+    # Common feed form: https://arxiv.org/abs/1710.10903v1
+    m = _ARXIV_ID_RE.search(raw)
+    if m:
+        return m.group("id")
+
+    # Sometimes the <id> is like "oai:arXiv.org:1710.10903"
+    if raw.lower().startswith("oai:arxiv.org:"):
+        candidate = raw.split(":")[-1]
+        m2 = _ARXIV_ID_RE.search(candidate)
+        if m2:
+            return m2.group("id")
+
+    # If it's already plain
+    if re.fullmatch(r"\d{4}\.\d{4,5}", raw):
+        return raw
+
+    raise ValueError(f"Could not normalize arXiv id from: {raw}")
+
+
+def arxiv_abs_url(arxiv_id: str) -> str:
+    return f"https://arxiv.org/abs/{arxiv_id}"
+
+
+def arxiv_pdf_url(arxiv_id: str) -> str:
+    return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+
+def build_search_query(query: str, categories: list[str]) -> str:
+    """Build an arXiv API search_query string.
+
+    If query already contains arXiv operators (cat:, all:, ti:, au:, abs:),
+    we assume the user knows what they are doing and we don't wrap it.
+
+    Otherwise we use: all:"<query>"
+
+    Categories (if provided) are added as: (cat:cs.LG OR cat:stat.ML ...)
+
+    Args:
+        query: Keyword query or full arXiv search expression.
+        categories: arXiv categories to filter.
+
+    Returns:
+        arXiv API search_query string.
+    """
+    q = (query or "").strip()
+    has_ops = any(op in q for op in ("cat:", "all:", "ti:", "au:", "abs:", "id:"))
+    if not has_ops:
+        q = f'all:"{q}"' if q else "all:*"
+
+    if categories:
+        cat_expr = " OR ".join([f"cat:{c.strip()}" for c in categories if c.strip()])
+        if cat_expr:
+            q = f"({q}) AND ({cat_expr})"
+
+    return q
+
+
+def os_client() -> OpenSearch:
+    """Create OpenSearch client (local, no auth)."""
+    return OpenSearch([{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}])
+
+
+def redis_client() -> redis.Redis:
+    """Create Redis client."""
+    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+
+
+def os_has_arxiv_id(client: OpenSearch, index: str, arxiv_id: str) -> bool:
+    """Check if an arxiv_id already exists in the given index.
+
+    Uses a lightweight count query.
+
+    Args:
+        client: OpenSearch client.
+        index: Index name (rag_chunks or rag_docs).
+        arxiv_id: Normalized arXiv id.
+
+    Returns:
+        True if already present; else False.
+    """
+    try:
+        resp = client.count(index=index, body={"query": {"term": {"arxiv_id": arxiv_id}}})
+        return int(resp.get("count", 0)) > 0
+    except Exception:
+        # If index doesn't exist or any error, treat as not present
+        return False
 
 
 @dataclass
 class ArxivEntry:
-    """Container for a parsed arXiv API entry."""
-
     arxiv_id: str
-    version: str
-    pdf_url: str
     title: str
     authors: list[str]
     categories: list[str]
-    published: str
-    updated: str
-    summary: str
-    link_abs: str
+    published: str  # ISO-like string from feed
+    abs_url: str
+    pdf_url: str
 
 
-def redis_client() -> redis.Redis:
-    """Create a Redis client.
-
-    Returns:
-        redis.Redis: Connected Redis client.
-    """
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
-
-def build_search_query(query: str, category: Optional[str]) -> str:
-    """Build an arXiv API search_query string.
+def parse_arxiv_feed(xml_text: str) -> list[ArxivEntry]:
+    """Parse arXiv Atom feed XML into entries.
 
     Args:
-        query: Keyword or phrase to search for (searched in title or abstract).
-        category: Optional arXiv category (e.g. "cs.LG", "cs.AI").
+        xml_text: Atom feed response body.
 
     Returns:
-        str: A valid arXiv API search_query string.
+        List of ArxivEntry.
     """
-    parts: list[str] = []
-
-    if query:
-        phrase = query.replace('"', '\\"')
-        parts.append(f'(ti:"{phrase}" OR abs:"{phrase}")')
-
-    if category:
-        parts.append(f"cat:{category}")
-
-    return " AND ".join(parts) if parts else "all:*"
-
-
-def arxiv_api_call(
-    search_query: str,
-    start: int,
-    max_results: int,
-    sort_by: str,
-    sort_order: str,
-    timeout_s: int = 60,
-) -> str:
-    """Call the arXiv API and return raw XML.
-
-    Args:
-        search_query: arXiv search_query expression.
-        start: Offset into result set.
-        max_results: Number of results to return.
-        sort_by: Sort field (e.g. submittedDate).
-        sort_order: Sort order (ascending or descending).
-        timeout_s: HTTP timeout in seconds.
-
-    Returns:
-        str: Raw Atom XML response.
-    """
-    params = {
-        "search_query": search_query,
-        "start": str(start),
-        "max_results": str(max_results),
-        "sortBy": sort_by,
-        "sortOrder": sort_order,
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
     }
-    url = ARXIV_API + "?" + urllib.parse.urlencode(params)
-    resp = requests.get(url, timeout=timeout_s)
-    resp.raise_for_status()
-    return resp.text
-
-
-def parse_id_and_version(id_text: str) -> tuple[str, str]:
-    """Extract arXiv ID and version from an entry ID URL.
-
-    Args:
-        id_text: Full arXiv ID URL (e.g. http://arxiv.org/abs/2401.12345v2).
-
-    Returns:
-        tuple[str, str]: (arxiv_id, version), e.g. ("2401.12345", "v2").
-    """
-    m = re.search(r"/abs/([^v]+)(v\d+)?$", id_text.strip())
-    if not m:
-        tail = id_text.rstrip("/").split("/")[-1]
-        m2 = re.match(r"^(.+?)(v\d+)?$", tail)
-        if m2:
-            return m2.group(1), (m2.group(2) or "")
-        return tail, ""
-    return m.group(1), (m.group(2) or "")
-
-
-def entry_pdf_link(entry: ET.Element) -> tuple[str, str]:
-    """Extract PDF and abstract URLs from an arXiv entry.
-
-    Args:
-        entry: XML element representing an arXiv entry.
-
-    Returns:
-        tuple[str, str]: (pdf_url, abstract_url)
-    """
-    pdf_url = ""
-    abs_url = ""
-
-    for link in entry.findall("a:link", ATOM_NS):
-        href = link.attrib.get("href", "")
-        title = link.attrib.get("title", "")
-        rel = link.attrib.get("rel", "")
-        typ = link.attrib.get("type", "")
-
-        if rel == "alternate" and (typ == "text/html" or "/abs/" in href):
-            abs_url = href
-
-        if title.lower() == "pdf" or href.endswith(".pdf"):
-            pdf_url = href
-
-    return pdf_url, abs_url
-
-
-def parse_feed(xml_text: str) -> list[ArxivEntry]:
-    """Parse an arXiv Atom feed into structured entries.
-
-    Args:
-        xml_text: Raw Atom XML returned by arXiv API.
-
-    Returns:
-        list[ArxivEntry]: Parsed arXiv entries.
-    """
     root = ET.fromstring(xml_text)
-    entries: list[ArxivEntry] = []
+    entries = []
 
-    for e in root.findall("a:entry", ATOM_NS):
-        id_text = e.findtext("a:id", "", ATOM_NS).strip()
-        title = e.findtext("a:title", "", ATOM_NS).strip()
-        summary = e.findtext("a:summary", "", ATOM_NS).strip()
-        published = e.findtext("a:published", "", ATOM_NS).strip()
-        updated = e.findtext("a:updated", "", ATOM_NS).strip()
+    for e in root.findall("atom:entry", ns):
+        raw_id = (e.findtext("atom:id", default="", namespaces=ns) or "").strip()
+        try:
+            aid = normalize_arxiv_id(raw_id)
+        except ValueError:
+            # Try arxiv:doi or arxiv:journal_ref not useful for id; skip
+            continue
 
-        authors = [
-            a.findtext("a:name", "", ATOM_NS).strip()
-            for a in e.findall("a:author", ATOM_NS)
-            if a.findtext("a:name", "", ATOM_NS)
-        ]
+        title = (e.findtext("atom:title", default="", namespaces=ns) or "").strip()
+        title = re.sub(r"\s+", " ", title)
 
-        categories = [
-            c.attrib.get("term", "").strip()
-            for c in e.findall("a:category", ATOM_NS)
-            if c.attrib.get("term")
-        ]
+        published = (e.findtext("atom:published", default="", namespaces=ns) or "").strip()
 
-        pdf_url, abs_url = entry_pdf_link(e)
-        arxiv_id, version = parse_id_and_version(id_text)
+        authors = []
+        for a in e.findall("atom:author", ns):
+            name = (a.findtext("atom:name", default="", namespaces=ns) or "").strip()
+            if name:
+                authors.append(name)
 
-        if not pdf_url and arxiv_id:
-            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}{version}.pdf"
-        if not abs_url and arxiv_id:
-            abs_url = f"https://arxiv.org/abs/{arxiv_id}{version}"
+        categories = []
+        for c in e.findall("atom:category", ns):
+            term = c.attrib.get("term", "").strip()
+            if term:
+                categories.append(term)
+
+        # Links: abs + pdf
+        abs_url = arxiv_abs_url(aid)
+        pdf_url = arxiv_pdf_url(aid)
+        for link in e.findall("atom:link", ns):
+            href = link.attrib.get("href", "")
+            ltype = link.attrib.get("type", "")
+            rel = link.attrib.get("rel", "")
+            title_attr = link.attrib.get("title", "")
+
+            # Usually: rel="alternate" is abs page
+            if rel == "alternate" and href:
+                abs_url = href.replace("http://", "https://")
+            # Usually: title="pdf" or type="application/pdf"
+            if (title_attr.lower() == "pdf" or ltype == "application/pdf") and href:
+                pdf_url = href.replace("http://", "https://")
 
         entries.append(
             ArxivEntry(
-                arxiv_id=arxiv_id,
-                version=version,
-                pdf_url=pdf_url,
-                title=" ".join(title.split()),
+                arxiv_id=aid,
+                title=title,
                 authors=authors,
-                categories=categories,
+                categories=sorted(set(categories)),
                 published=published,
-                updated=updated,
-                summary=summary,
-                link_abs=abs_url,
+                abs_url=abs_url,
+                pdf_url=pdf_url,
             )
         )
 
     return entries
 
 
-def to_job(entry: ArxivEntry) -> dict[str, Any]:
-    """Convert an ArxivEntry into a Redis ingestion job.
+def fetch_arxiv_entries(
+    *,
+    search_query: str,
+    start: int,
+    max_results: int,
+    sort_by: str,
+    sort_order: str,
+    polite_delay_s: float,
+) -> list[ArxivEntry]:
+    """Fetch a page of arXiv results."""
+    params = {
+        "search_query": search_query,
+        "start": start,
+        "max_results": max_results,
+        "sortBy": sort_by,
+        "sortOrder": sort_order,
+    }
+    r = requests.get(ARXIV_API, params=params, timeout=60)
+    r.raise_for_status()
+    time.sleep(max(0.0, polite_delay_s))
+    return parse_arxiv_feed(r.text)
 
-    Args:
-        entry: Parsed arXiv entry.
 
-    Returns:
-        dict[str, Any]: Job payload compatible with ingest_worker.py.
-    """
+def to_job(entry: ArxivEntry, manual_test: bool = False) -> dict[str, Any]:
+    """Convert an arXiv entry into your ingestion job schema."""
     return {
         "arxiv_id": entry.arxiv_id,
-        "version": entry.version,
+        "version": "",
         "pdf_url": entry.pdf_url,
         "title": entry.title,
         "authors": entry.authors,
         "categories": entry.categories,
         "published": entry.published,
         "metadata": {
-            "updated": entry.updated,
-            "summary": entry.summary,
-            "abs_url": entry.link_abs,
+            "abs_url": entry.abs_url,
+            "manual_test": bool(manual_test),
         },
     }
 
 
-def enqueue_jobs(jobs: Iterable[dict[str, Any]], dedupe: bool) -> int:
-    """Push jobs into Redis.
-
-    Args:
-        jobs: Iterable of job dictionaries.
-        dedupe: Whether to deduplicate by arxiv_id + version.
-
-    Returns:
-        int: Number of jobs enqueued.
-    """
-    r = redis_client()
-    count = 0
-
+def enqueue_jobs(
+    r: redis.Redis,
+    queue: str,
+    jobs: Iterable[dict[str, Any]],
+) -> int:
+    """Push jobs onto Redis list queue."""
+    n = 0
     for job in jobs:
-        if dedupe:
-            key = f"seen:{job.get('arxiv_id')}:{job.get('version')}"
-            if r.setnx(key, "1") == 0:
-                continue
-            r.expire(key, 30 * 24 * 3600)
+        r.rpush(queue, json.dumps(job))
+        n += 1
+    return n
 
-        r.rpush(REDIS_QUEUE, json.dumps(job))
-        count += 1
 
-    return count
-
+# -------------------------
+# CLI
+# -------------------------
 
 def main() -> None:
-    """CLI entry point."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--query", default="graph neural network")
-    ap.add_argument("--category", default=None)
-    ap.add_argument("--max-results", type=int, default=25)
-    ap.add_argument("--page-size", type=int, default=25)
-    ap.add_argument("--start", type=int, default=0)
-    ap.add_argument("--sort", default="submittedDate",
-                    choices=["relevance", "lastUpdatedDate", "submittedDate"])
-    ap.add_argument("--order", default="descending",
-                    choices=["ascending", "descending"])
-    ap.add_argument("--throttle-seconds", type=float, default=DEFAULT_THROTTLE_S)
-    ap.add_argument("--dedupe", action="store_true")
+    ap.add_argument("--query", required=True, help='Keyword query, or full arXiv search expression (e.g. all:"graph neural network")')
+    ap.add_argument("--categories", default="", help="Comma-separated arXiv categories to filter (e.g. cs.LG,cs.AI,stat.ML)")
+    ap.add_argument("--max-results", type=int, default=50, help="Max number of papers to enqueue")
+    ap.add_argument("--page-size", type=int, default=50, help="Page size per arXiv API call (<= 2000; recommend 50-200)")
+    ap.add_argument("--start", type=int, default=0, help="Start offset for arXiv API")
+    ap.add_argument("--sort-by", default="submittedDate", choices=["relevance", "lastUpdatedDate", "submittedDate"], help="arXiv sortBy")
+    ap.add_argument("--sort-order", default="descending", choices=["ascending", "descending"], help="arXiv sortOrder")
+    ap.add_argument("--polite-delay", type=float, default=0.25, help="Delay between API calls (seconds)")
+
+    ap.add_argument("--queue", default=REDIS_QUEUE, help="Redis list name to enqueue jobs into")
+    ap.add_argument("--dedupe", action="store_true", help="Dedupe against OpenSearch by arxiv_id")
+    ap.add_argument("--dedupe-index", default=DEFAULT_DEDUPE_INDEX, help="OpenSearch index to check for dedupe (rag_chunks or rag_docs)")
+
+    ap.add_argument("--out", default="", help="Optional: write enqueued jobs to a JSONL file")
+    ap.add_argument("--manual-test", action="store_true", help="Set metadata.manual_test=true on jobs")
+
     args = ap.parse_args()
 
-    search_query = build_search_query(args.query, args.category)
-    total_target = max(0, args.max_results)
+    categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+    search_q = build_search_query(args.query, categories)
+
+    print(f"[INFO] arXiv search_query: {search_q}")
+    print(f"[INFO] Target enqueue count: {args.max_results}")
+    print(f"[INFO] Redis queue: {args.queue}")
+    if args.dedupe:
+        print(f"[INFO] Dedupe enabled: OpenSearch index '{args.dedupe_index}'")
+    if args.out:
+        print(f"[INFO] Writing enqueued jobs to: {args.out} (JSONL)")
+
+    os_cli = os_client() if args.dedupe else None
+    r = redis_client()
+
+    remaining = args.max_results
+    start = args.start
     page_size = max(1, min(args.page_size, 2000))
 
-    print(f"[INFO] search_query: {search_query}")
-    print(f"[INFO] target={total_target}, page_size={page_size}")
-
+    out_f = open(args.out, "w", encoding="utf-8") if args.out else None
     enqueued = 0
-    start = args.start
+    seen_ids: set[str] = set()
 
-    while enqueued < total_target:
-        batch = min(page_size, total_target - enqueued)
+    try:
+        while remaining > 0:
+            batch_n = min(page_size, remaining)
+            entries = fetch_arxiv_entries(
+                search_query=search_q,
+                start=start,
+                max_results=batch_n,
+                sort_by=args.sort_by,
+                sort_order=args.sort_order,
+                polite_delay_s=args.polite_delay,
+            )
+            if not entries:
+                print("[INFO] No more results from arXiv.")
+                break
 
-        xml_text = arxiv_api_call(
-            search_query=search_query,
-            start=start,
-            max_results=batch,
-            sort_by=args.sort,
-            sort_order=args.order,
-        )
+            jobs_to_push: list[dict[str, Any]] = []
+            for e in entries:
+                if e.arxiv_id in seen_ids:
+                    continue
+                seen_ids.add(e.arxiv_id)
 
-        entries = parse_feed(xml_text)
-        if not entries:
-            break
+                if args.dedupe and os_cli is not None:
+                    if os_has_arxiv_id(os_cli, args.dedupe_index, e.arxiv_id):
+                        print(f"[SKIP] {e.arxiv_id} (already in {args.dedupe_index})  {e.title}")
+                        continue
 
-        jobs = [to_job(e) for e in entries]
-        added = enqueue_jobs(jobs, dedupe=args.dedupe)
+                job = to_job(e, manual_test=args.manual_test)
+                jobs_to_push.append(job)
 
-        enqueued += added
-        start += batch
+            if jobs_to_push:
+                n = enqueue_jobs(r, args.queue, jobs_to_push)
+                enqueued += n
+                for job in jobs_to_push:
+                    print(f"[ENQ] {job['arxiv_id']}  {job['title']}")
+                    if out_f:
+                        out_f.write(json.dumps(job, ensure_ascii=False) + "\n")
+                remaining -= len(jobs_to_push)
+            else:
+                print("[INFO] Batch produced no new jobs (all duplicates or filtered).")
 
-        print(f"[OK] Enqueued {added} (total {enqueued}/{total_target})")
-        time.sleep(max(0.0, args.throttle_seconds))
+            # Next page
+            start += batch_n
 
-    print(f"[DONE] Total enqueued: {enqueued}")
+            # Safety: if we keep getting nothing new, don't loop forever
+            if start > args.start + 10_000 and enqueued == 0:
+                print("[WARN] Large start offset with no enqueues; stopping.")
+                break
+
+        print(f"[DONE] Enqueued {enqueued} jobs to Redis list '{args.queue}'.")
+        if out_f:
+            out_f.flush()
+
+    finally:
+        if out_f:
+            out_f.close()
 
 
 if __name__ == "__main__":

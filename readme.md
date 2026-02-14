@@ -26,6 +26,10 @@ docker compose exec ollama ollama pull llama3.1
 Start the ingestion worker (Terminal A)
 python -m src.ingest_worker --index rag_chunks
 
+(OPTIONAL) Run above using Makerfile
+Run command: make worker
+
+
 Confirm index has data
 curl -s "http://localhost:9200/rag_chunks/_count" | cat
 
